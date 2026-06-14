@@ -77,12 +77,24 @@ export async function generateVideo(
   for (let i = 0; i < plan.length; i++) {
     const seg = plan[i]
     const out = `seg${i}.mp4`
+    const fadeDur = 0.4
+    const vf = [
+      'scale=1920:1080:force_original_aspect_ratio=decrease',
+      'pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
+      'setsar=1',
+      'fps=30',
+    ]
+    if (useCrossfade) {
+      const fadeOutStart = Math.max(0, seg.duration - fadeDur)
+      vf.push(`fade=t=in:st=0:d=${fadeDur}`)
+      vf.push(`fade=t=out:st=${fadeOutStart.toFixed(2)}:d=${fadeDur}`)
+    }
     await ff.exec([
       '-ss', String(seg.start),
       '-i', clipNames[seg.clipIndex],
       '-t', String(seg.duration),
-      '-an',                              // drop original audio, we add the song later
-      '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30',
+      '-an',
+      '-vf', vf.join(','),
       '-c:v', 'libx264', '-preset', 'ultrafast',
       out,
     ])
@@ -90,42 +102,14 @@ export async function generateVideo(
     onProgress?.(`Cut segment ${i + 1} of ${plan.length}`)
   }
 
-  // 3. Join segments — crossfade or hard cut
-  const FADE = 0.4 // seconds of overlap between clips
-  if (useCrossfade && segFiles.length > 1) {
-    onProgress?.('Blending transitions…')
-    // Build an xfade chain: each clip dissolves into the next
-    const inputs: string[] = []
-    for (const f of segFiles) inputs.push('-i', f)
-
-    let filter = ''
-    let lastLabel = '[0:v]'
-    let offset = 0
-    for (let i = 1; i < segFiles.length; i++) {
-      const segDur = plan[i - 1].duration
-      offset += segDur - FADE
-      const out = i === segFiles.length - 1 ? '[vout]' : `[v${i}]`
-      filter += `${lastLabel}[${i}:v]xfade=transition=fade:duration=${FADE}:offset=${offset.toFixed(2)}${out};`
-      lastLabel = out
-    }
-    filter = filter.slice(0, -1) // drop trailing ;
-
-    await ff.exec([
-      ...inputs,
-      '-filter_complex', filter,
-      '-map', '[vout]',
-      '-c:v', 'libx264', '-preset', 'ultrafast',
-      'silent.mp4',
-    ])
-  } else {
-    onProgress?.('Stitching…')
-    const listText = segFiles.map((f) => `file '${f}'`).join('\n')
-    await ff.writeFile('list.txt', listText)
-    await ff.exec([
-      '-f', 'concat', '-safe', '0', '-i', 'list.txt',
-      '-c', 'copy', 'silent.mp4',
-    ])
-  }
+  // 3. Stitch all segments (fades are already baked into each segment)
+  onProgress?.('Stitching…')
+  const listText = segFiles.map((f) => `file '${f}'`).join('\n')
+  await ff.writeFile('list.txt', listText)
+  await ff.exec([
+    '-f', 'concat', '-safe', '0', '-i', 'list.txt',
+    '-c', 'copy', 'silent.mp4',
+  ])
 
   // 4. Add the audio track, trim to whichever ends first
   onProgress?.('Adding music…')

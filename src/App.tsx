@@ -8,7 +8,7 @@ function App() {
 const [videoUrl, setVideoUrl] = useState<string | null>(null)
   const [status, setStatus] = useState('')
   const [segLength, setSegLength] = useState(3)
-  const [crossfade, setCrossfade] = useState(true)
+  const [crossfade, setCrossfade] = useState(false)
   const handleClips = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
       const newClips = Array.from(e.target.files)
