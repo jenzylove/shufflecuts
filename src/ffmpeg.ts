@@ -101,7 +101,10 @@ export async function generateVideo(
     segFiles.push(out)
     onProgress?.(`Cut segment ${i + 1} of ${plan.length}`)
   }
-
+// Free source clips — segments are already cut, originals no longer needed
+  for (const name of clipNames) {
+    try { await ff.deleteFile(name) } catch { /* already gone */ }
+  }
   // 3. Stitch all segments (fades are already baked into each segment)
   onProgress?.('Stitching…')
   const listText = segFiles.map((f) => `file '${f}'`).join('\n')
@@ -111,6 +114,12 @@ export async function generateVideo(
     '-c', 'copy', 'silent.mp4',
   ])
 
+  // Free segment files — they're now baked into silent.mp4
+  for (const f of segFiles) {
+    try { await ff.deleteFile(f) } catch { /* already gone */ }
+  }
+  try { await ff.deleteFile('list.txt') } catch { /* ignore */ }
+
   // 4. Add the audio track, trim to whichever ends first
   onProgress?.('Adding music…')
   await ff.exec([
@@ -119,7 +128,9 @@ export async function generateVideo(
     '-c:v', 'copy', '-c:a', 'aac',
     '-shortest', 'final.mp4',
   ])
-
+// Free intermediates — final.mp4 already exists, safe to clean
+  try { await ff.deleteFile('silent.mp4') } catch { /* ignore */ }
+  try { await ff.deleteFile('audio.mp3') } catch { /* ignore */ }
   // 5. Read the result back out as a playable URL
   onProgress?.('Finishing…')
   const data = await ff.readFile('final.mp4')
