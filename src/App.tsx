@@ -16,12 +16,26 @@ const [videoUrl, setVideoUrl] = useState<string | null>(null)
     if (e.target.files) {
       const newClips = Array.from(e.target.files)
       setClips((prev) => [...prev, ...newClips])
+      pendo.track("clips_imported", {
+        clipsAddedCount: newClips.length,
+        totalClipCount: clips.length + newClips.length,
+        fileTypes: [...new Set(newClips.map(f => f.type))].join(", "),
+        totalFileSize: newClips.reduce((sum, f) => sum + f.size, 0),
+      })
     }
     e.target.value = '' // reset so the same file can be re-picked if needed
   }
 
   const handleAudio = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files?.[0]) setAudio(e.target.files[0])
+    if (e.target.files?.[0]) {
+      const file = e.target.files[0]
+      setAudio(file)
+      pendo.track("audio_track_imported", {
+        fileName: file.name,
+        fileType: file.type,
+        fileSize: file.size,
+      })
+    }
   }
   const handleGenerate = async () => {
     if (clips.length === 0 || !audio) {
@@ -31,6 +45,12 @@ const [videoUrl, setVideoUrl] = useState<string | null>(null)
     setVideoUrl(null)
     setError('')
     setStatus('Reading durations…')
+
+    pendo.track("video_generation_started", {
+      clipCount: clips.length,
+      segmentLength: segLength,
+      crossfadeEnabled: crossfade,
+    })
 
     try {
       const clipDurations = []
@@ -47,12 +67,27 @@ const [videoUrl, setVideoUrl] = useState<string | null>(null)
       const url = await generateVideo(clips, audio, plan, crossfade, (msg) => setStatus(msg))
       setVideoUrl(url)
       setStatus('')
+
+      pendo.track("video_generation_completed", {
+        clipCount: clips.length,
+        segmentLength: segLength,
+        crossfadeEnabled: crossfade,
+        totalSegments: plan.length,
+        songDuration,
+      })
     } catch (err) {
       console.error(err)
       setStatus('')
       setError(
         'That was a lot of footage for your browser to handle. Try fewer clips, shorter clips, or turn off smooth transitions, then generate again.'
       )
+
+      pendo.track("video_generation_failed", {
+        clipCount: clips.length,
+        segmentLength: segLength,
+        crossfadeEnabled: crossfade,
+        errorMessage: (err instanceof Error ? err.message : String(err)).substring(0, 200),
+      })
     }
   }
   return (
@@ -147,10 +182,16 @@ const [videoUrl, setVideoUrl] = useState<string | null>(null)
             <a
               href={videoUrl}
               download="shufflecuts.mp4"
+              onClick={() => {
+                pendo.track("video_exported", {
+                  clipCount: clips.length,
+                  segmentLength: segLength,
+                  crossfadeEnabled: crossfade,
+                })
+              }}
               className="mt-3 block text-center bg-white/5 hover:bg-white/10 transition rounded-xl py-3 text-sm font-medium"
             >
               Download MP4
-              
             </a>
             <div className="mt-5 pt-5 border-t border-white/5">
               {waitlisted ? (
@@ -180,6 +221,9 @@ const [videoUrl, setVideoUrl] = useState<string | null>(null)
                         } catch {
                           setWaitlisted(true) // still confirm to user even if it hiccups
                         }
+                        pendo.track("pro_waitlist_joined", {
+                          emailDomain: waitlistEmail.split('@')[1] || "",
+                        })
                       }}
                       className="bg-violet-600 hover:bg-violet-500 transition rounded-lg px-4 py-2 text-sm font-medium"
                     >
