@@ -10,6 +10,8 @@ const [videoUrl, setVideoUrl] = useState<string | null>(null)
   const [segLength, setSegLength] = useState(3)
   const [crossfade, setCrossfade] = useState(false)
   const [error, setError] = useState('')
+  const [waitlistEmail, setWaitlistEmail] = useState('')
+  const [waitlisted, setWaitlisted] = useState(false)
   const handleClips = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
       const newClips = Array.from(e.target.files)
@@ -148,7 +150,45 @@ const [videoUrl, setVideoUrl] = useState<string | null>(null)
               className="mt-3 block text-center bg-white/5 hover:bg-white/10 transition rounded-xl py-3 text-sm font-medium"
             >
               Download MP4
+              
             </a>
+            <div className="mt-5 pt-5 border-t border-white/5">
+              {waitlisted ? (
+                <p className="text-sm text-violet-300 text-center">You're on the list — thanks! 🎬</p>
+              ) : (
+                <>
+                  <p className="text-sm text-neutral-300 mb-1">Want auto-lyrics, longer exports & saved history?</p>
+                  <p className="text-xs text-neutral-500 mb-3">Join the Pro waitlist — be first to know.</p>
+                  <div className="flex gap-2">
+                    <input
+                      type="email"
+                      value={waitlistEmail}
+                      onChange={(e) => setWaitlistEmail(e.target.value)}
+                      placeholder="your@email.com"
+                      className="flex-1 bg-[#0a0a0f] border border-neutral-700 rounded-lg px-3 py-2 text-sm focus:border-violet-500 focus:outline-none"
+                    />
+                    <button
+                      onClick={async () => {
+                        if (!waitlistEmail.includes('@')) return
+                        try {
+                          await fetch('https://formspree.io/f/mnjywwyl', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ email: waitlistEmail }),
+                          })
+                          setWaitlisted(true)
+                        } catch {
+                          setWaitlisted(true) // still confirm to user even if it hiccups
+                        }
+                      }}
+                      className="bg-violet-600 hover:bg-violet-500 transition rounded-lg px-4 py-2 text-sm font-medium"
+                    >
+                      Join
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
         )}
       </main>
