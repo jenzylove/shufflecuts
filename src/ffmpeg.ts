@@ -105,20 +105,47 @@ export async function generateVideo(
   for (const name of clipNames) {
     try { await ff.deleteFile(name) } catch { /* already gone */ }
   }
-  // 3. Stitch all segments (fades are already baked into each segment)
+  // 3. Stitch in batches so memory never holds all segments at once
   onProgress?.('Stitching…')
-  const listText = segFiles.map((f) => `file '${f}'`).join('\n')
-  await ff.writeFile('list.txt', listText)
+  const BATCH = 10
+  const chunkFiles: string[] = []
+
+  for (let start = 0; start < segFiles.length; start += BATCH) {
+    const batch = segFiles.slice(start, start + BATCH)
+    const chunkName = `chunk${chunkFiles.length}.mp4`
+
+    // concat list for just this batch
+    const listText = batch.map((f) => `file '${f}'`).join('\n')
+    await ff.writeFile('list.txt', listText)
+    await ff.exec([
+      '-f', 'concat', '-safe', '0', '-i', 'list.txt',
+      '-c', 'copy', chunkName,
+    ])
+    chunkFiles.push(chunkName)
+
+    // free this batch's raw segments immediately
+    for (const f of batch) {
+      try { await ff.deleteFile(f) } catch { /* already gone */ }
+    }
+    try { await ff.deleteFile('list.txt') } catch { /* ignore */ }
+
+    onProgress?.(`Stitching… ${Math.min(start + BATCH, segFiles.length)} of ${segFiles.length}`)
+  }
+
+  // Glue the chunks into the final silent video
+  onProgress?.('Combining…')
+  const chunkList = chunkFiles.map((f) => `file '${f}'`).join('\n')
+  await ff.writeFile('chunks.txt', chunkList)
   await ff.exec([
-    '-f', 'concat', '-safe', '0', '-i', 'list.txt',
+    '-f', 'concat', '-safe', '0', '-i', 'chunks.txt',
     '-c', 'copy', 'silent.mp4',
   ])
 
-  // Free segment files — they're now baked into silent.mp4
-  for (const f of segFiles) {
-    try { await ff.deleteFile(f) } catch { /* already gone */ }
+  // free chunks
+  for (const f of chunkFiles) {
+    try { await ff.deleteFile(f) } catch { /* ignore */ }
   }
-  try { await ff.deleteFile('list.txt') } catch { /* ignore */ }
+  try { await ff.deleteFile('chunks.txt') } catch { /* ignore */ }
 
   // 4. Add the audio track, trim to whichever ends first
   onProgress?.('Adding music…')
