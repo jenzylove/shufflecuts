@@ -71,51 +71,50 @@ export async function generateVideo(
   }
   await ff.writeFile('audio.mp3', await fetchFile(audio))
 
-  // 2. Cut each planned segment into its own small file (normalized to 1080p, 30fps)
-  onProgress?.('Cutting segments…')
-  const segFiles: string[] = []
-  for (let i = 0; i < plan.length; i++) {
-    const seg = plan[i]
-    const out = `seg${i}.mp4`
-    const fadeDur = 0.4
-    const vf = [
-      'scale=1920:1080:force_original_aspect_ratio=decrease',
-      'pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
-      'setsar=1',
-      'fps=30',
-    ]
-    if (useCrossfade) {
-      const fadeOutStart = Math.max(0, seg.duration - fadeDur)
-      vf.push(`fade=t=in:st=0:d=${fadeDur}`)
-      vf.push(`fade=t=out:st=${fadeOutStart.toFixed(2)}:d=${fadeDur}`)
-    }
-    await ff.exec([
-      '-ss', String(seg.start),
-      '-i', clipNames[seg.clipIndex],
-      '-t', String(seg.duration),
-      '-an',
-      '-vf', vf.join(','),
-      '-c:v', 'libx264', '-preset', 'ultrafast',
-      out,
-    ])
-    segFiles.push(out)
-    onProgress?.(`Cut segment ${i + 1} of ${plan.length}`)
-  }
-// Free source clips — segments are already cut, originals no longer needed
-  for (const name of clipNames) {
-    try { await ff.deleteFile(name) } catch { /* already gone */ }
-  }
-  // 3. Stitch in batches so memory never holds all segments at once
-  onProgress?.('Stitching…')
-  const BATCH = 10
+  // 2 + 3. Cut and stitch in interleaved batches so memory never holds
+  // more than one batch of segments at a time.
+  onProgress?.('Processing…')
+  const BATCH = 8
   const chunkFiles: string[] = []
+  let segCounter = 0
 
-  for (let start = 0; start < segFiles.length; start += BATCH) {
-    const batch = segFiles.slice(start, start + BATCH)
+  for (let batchStart = 0; batchStart < plan.length; batchStart += BATCH) {
+    const batchEnd = Math.min(batchStart + BATCH, plan.length)
+    const batchSegNames: string[] = []
+
+    // Cut this batch's segments
+    for (let i = batchStart; i < batchEnd; i++) {
+      const seg = plan[i]
+      const out = `seg${i}.mp4`
+      const fadeDur = 0.4
+      const vf = [
+        'scale=1920:1080:force_original_aspect_ratio=decrease',
+        'pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
+        'setsar=1',
+        'fps=30',
+      ]
+      if (useCrossfade) {
+        const fadeOutStart = Math.max(0, seg.duration - fadeDur)
+        vf.push(`fade=t=in:st=0:d=${fadeDur}`)
+        vf.push(`fade=t=out:st=${fadeOutStart.toFixed(2)}:d=${fadeDur}`)
+      }
+      await ff.exec([
+        '-ss', String(seg.start),
+        '-i', clipNames[seg.clipIndex],
+        '-t', String(seg.duration),
+        '-an',
+        '-vf', vf.join(','),
+        '-c:v', 'libx264', '-preset', 'ultrafast',
+        out,
+      ])
+      batchSegNames.push(out)
+      segCounter++
+      onProgress?.(`Processing segment ${segCounter} of ${plan.length}`)
+    }
+
+    // Immediately stitch this batch into a chunk
     const chunkName = `chunk${chunkFiles.length}.mp4`
-
-    // concat list for just this batch
-    const listText = batch.map((f) => `file '${f}'`).join('\n')
+    const listText = batchSegNames.map((f) => `file '${f}'`).join('\n')
     await ff.writeFile('list.txt', listText)
     await ff.exec([
       '-f', 'concat', '-safe', '0', '-i', 'list.txt',
@@ -123,16 +122,19 @@ export async function generateVideo(
     ])
     chunkFiles.push(chunkName)
 
-    // free this batch's raw segments immediately
-    for (const f of batch) {
+    // Free this batch's segments right away — keeps memory flat
+    for (const f of batchSegNames) {
       try { await ff.deleteFile(f) } catch { /* already gone */ }
     }
     try { await ff.deleteFile('list.txt') } catch { /* ignore */ }
-
-    onProgress?.(`Stitching… ${Math.min(start + BATCH, segFiles.length)} of ${segFiles.length}`)
   }
 
-  // Glue the chunks into the final silent video
+  // Free source clips now that all cutting is done
+  for (const name of clipNames) {
+    try { await ff.deleteFile(name) } catch { /* already gone */ }
+  }
+
+  // Combine all chunks into the final silent video
   onProgress?.('Combining…')
   const chunkList = chunkFiles.map((f) => `file '${f}'`).join('\n')
   await ff.writeFile('chunks.txt', chunkList)
@@ -140,8 +142,6 @@ export async function generateVideo(
     '-f', 'concat', '-safe', '0', '-i', 'chunks.txt',
     '-c', 'copy', 'silent.mp4',
   ])
-
-  // free chunks
   for (const f of chunkFiles) {
     try { await ff.deleteFile(f) } catch { /* ignore */ }
   }
