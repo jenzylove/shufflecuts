@@ -7,7 +7,7 @@ function App() {
   const [audio, setAudio] = useState<File | null>(null)
 const [videoUrl, setVideoUrl] = useState<string | null>(null)
   const [status, setStatus] = useState('')
-  const [segLength, setSegLength] = useState(3)
+  const [segLength, setSegLength] = useState(4)
   const [crossfade, setCrossfade] = useState(false)
   const [error, setError] = useState('')
   const [waitlistEmail, setWaitlistEmail] = useState('')
@@ -47,6 +47,7 @@ const [videoUrl, setVideoUrl] = useState<string | null>(null)
       const url = await generateVideo(clips, audio, plan, crossfade, (msg) => setStatus(msg))
       setVideoUrl(url)
       setStatus('')
+      try { (window as any).pendo?.track('video_generated', { clips: clips.length, cutLength: segLength }) } catch { /* analytics optional */ }
     } catch (err) {
       console.error(err)
       setStatus('')
@@ -177,6 +178,7 @@ const [videoUrl, setVideoUrl] = useState<string | null>(null)
                             body: JSON.stringify({ email: waitlistEmail }),
                           })
                           setWaitlisted(true)
+                          try { (window as any).pendo?.track('waitlist_joined') } catch { /* analytics optional */ }
                         } catch {
                           setWaitlisted(true) // still confirm to user even if it hiccups
                         }
