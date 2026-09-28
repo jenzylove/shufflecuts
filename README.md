@@ -1,73 +1,40 @@
-# React + TypeScript + Vite
+<p align="center">
+  <img src="docs/screenshot.png" alt="ShuffleCuts" width="560">
+</p>
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+<h1 align="center">ShuffleCuts</h1>
 
-Currently, two official plugins are available:
+<p align="center">
+  <b>Drop your clips and a song. Get a music video.</b><br>
+  <a href="https://shufflecuts.vercel.app">shufflecuts.vercel.app</a>
+</p>
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+---
 
-## React Compiler
+Got a folder of clips from a trip, a party or a match, and a song you want them set to? ShuffleCuts cuts them into a music video that lasts exactly as long as the song. No editing timeline, no account, no upload.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## How to use it
 
-## Expanding the ESLint configuration
+1. **Drop your clips.** Any video files, as many as you like.
+2. **Add your track.** The song sets the length of the video.
+3. **Pick a cut length** (2 to 10 seconds per shot) and choose whether you want smooth transitions.
+4. **Generate.** Watch it right away and download it.
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+## How it works
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+- **Every clip gets its turn.** Shots rotate through your clips in order, so no single clip takes over the video.
+- **No repeats of the same moment.** Each clip keeps its own place and moves forward through its footage, and each one starts at a different point.
+- **It all happens on your device.** The video is put together in your browser with ffmpeg compiled for the web. Your clips never leave your computer or phone.
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+## Run it yourself
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm install
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Built with React, TypeScript, Vite, Tailwind and ffmpeg.wasm.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Good to know
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+Very long or very many clips can be too much for a browser's memory. If a video fails, try fewer or shorter clips, or turn off smooth transitions.
