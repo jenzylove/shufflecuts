@@ -5,34 +5,43 @@ export interface Segment {
 }
 
 interface ShuffleOptions {
-  clipCount: number
   clipDurations: number[]
   songDuration: number
   segmentLength: number
 }
 
+// Clips shorter than this are left out of the rotation.
+const MIN_CLIP_SECONDS = 0.1
+
 export function buildShufflePlan(opts: ShuffleOptions): Segment[] {
-  const { clipCount, clipDurations, songDuration, segmentLength } = opts
+  const { clipDurations, songDuration, segmentLength } = opts
   const plan: Segment[] = []
+
+  const usable = clipDurations
+    .map((_, i) => i)
+    .filter((i) => clipDurations[i] >= MIN_CLIP_SECONDS)
+  if (usable.length === 0 || !(songDuration > 0) || !(segmentLength > 0)) return plan
 
   // Each clip has its own playhead that walks FORWARD through its timeline.
   // Start each at a different offset so they don't all begin at 0:00.
-  const playhead: number[] = clipDurations.map((len, i) =>
-    (len / clipCount) * i % Math.max(len, 1)
-  )
+  const playhead: number[] = clipDurations.map(() => 0)
+  usable.forEach((clip, i) => {
+    const len = clipDurations[clip]
+    playhead[clip] = (len / usable.length) * i % Math.max(len, 1)
+  })
 
   let filled = 0
   let rotation = 0  // strict round-robin pointer
 
-  while (filled < songDuration) {
+  while (songDuration - filled > 0.001) {
     // Strict rotation: A, B, C, A, B, C... guarantees even use, no domination
-    const chosen = rotation % clipCount
+    const chosen = usable[rotation % usable.length]
     rotation++
 
-    const remaining = songDuration - filled
-    const dur = Math.min(segmentLength, remaining)
-
     const clipLen = clipDurations[chosen]
+    // A clip shorter than the cut plays whole, and the next clip picks up the
+    // rest, so the video always lasts exactly as long as the song.
+    const dur = Math.min(segmentLength, songDuration - filled, clipLen)
 
     // Take the segment at this clip's current playhead
     let start = playhead[chosen]

@@ -1,32 +1,83 @@
-import { FFmpeg } from '@ffmpeg/ffmpeg'
-import { fetchFile } from '@ffmpeg/util'
-import type { Segment } from './shuffle'
+import { FFmpeg, FFFSType } from '@ffmpeg/ffmpeg'
 import coreURL from '@ffmpeg/core?url'
 import wasmURL from '@ffmpeg/core/wasm?url'
+import { ClipError, EngineLoadError, abortError, fillsFrame, type OnProgress, type SizedJob } from './render'
 
-let ffmpeg: FFmpeg | null = null
+// Fallback renderer for browsers without hardware encoding (WebCodecs), or for
+// files the browser itself can't decode. Software encoding on one thread, so
+// it is much slower than the fast path.
 
-export async function getFFmpeg(): Promise<FFmpeg> {
-  if (ffmpeg) return ffmpeg
+// Size of ffmpeg-core.wasm once decompressed, for download progress.
+const WASM_BYTES = 32_129_114
 
-  ffmpeg = new FFmpeg()
+let engine: Promise<FFmpeg> | null = null
+let onDownload: ((fraction: number) => void) | null = null
+let runCounter = 0
 
-  ffmpeg.on('log', ({ message }) => {
-    console.log('[ffmpeg]', message)
-  })
+export function loadEngine(progress?: (fraction: number) => void): Promise<FFmpeg> {
+  if (progress) onDownload = progress
+  if (!engine) {
+    engine = (async () => {
+      let wasmBlobURL = ''
+      try {
+        // Fetch the 10 MB engine ourselves so the user sees download progress.
+        const res = await fetch(wasmURL)
+        if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`)
+        const reader = res.body.getReader()
+        const chunks: Uint8Array<ArrayBuffer>[] = []
+        let received = 0
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          chunks.push(value)
+          received += value.length
+          onDownload?.(Math.min(0.99, received / WASM_BYTES))
+        }
+        wasmBlobURL = URL.createObjectURL(new Blob(chunks, { type: 'application/wasm' }))
+        const ff = new FFmpeg()
+        if (import.meta.env.DEV) ff.on('log', ({ message }) => console.log('[ffmpeg]', message))
+        await ff.load({ coreURL, wasmURL: wasmBlobURL })
+        onDownload?.(1)
+        return ff
+      } catch (err) {
+        engine = null
+        throw new EngineLoadError('Could not load the video engine', { cause: err })
+      } finally {
+        if (wasmBlobURL) URL.revokeObjectURL(wasmBlobURL)
+      }
+    })()
+  }
+  return engine
+}
 
-  await ffmpeg.load({ coreURL, wasmURL })
+// After a failure or a cancel the engine may be stuck mid command or out of
+// memory. Throw it away so the next try starts clean.
+function resetEngine() {
+  const current = engine
+  engine = null
+  current?.then((ff) => ff.terminate()).catch(() => {})
+}
 
-  return ffmpeg
+// Clips are mounted read only: ffmpeg reads them from disk as it goes
+// instead of holding a full copy of every file in memory.
+async function mountFiles(ff: FFmpeg, blobs: { name: string; data: Blob }[]): Promise<string> {
+  const dir = `/in${++runCounter}`
+  await ff.createDir(dir)
+  await ff.mount(FFFSType.WORKERFS, { blobs }, dir)
+  return dir
+}
+
+async function unmountFiles(ff: FFmpeg, dir: string) {
+  try {
+    await ff.unmount(dir)
+    await ff.deleteDir(dir)
+  } catch { /* engine already reset */ }
 }
 
 // Reads how many seconds long a video/audio file is.
 export async function getDuration(file: File): Promise<number> {
-  const ff = await getFFmpeg()
-  const name = 'probe_' + file.name.replace(/[^a-zA-Z0-9.]/g, '_')
-
-  await ff.writeFile(name, await fetchFile(file))
-
+  const ff = await loadEngine()
+  const dir = await mountFiles(ff, [{ name: 'probe', data: file }])
   let duration = 0
   // ffmpeg prints duration in its logs; we capture it.
   const handler = ({ message }: { message: string }) => {
@@ -37,131 +88,102 @@ export async function getDuration(file: File): Promise<number> {
     }
   }
   ff.on('log', handler)
-
-  // Run a harmless command that makes ffmpeg report the file's info
   try {
-    await ff.exec(['-i', name])
-  } catch {
-    // ffmpeg "errors" on -i with no output, but still prints duration — that's fine
+    // Exits non zero because there is no output, but still prints the duration.
+    await ff.exec(['-hide_banner', '-i', `${dir}/probe`])
+  } finally {
+    ff.off('log', handler)
+    await unmountFiles(ff, dir)
   }
-
-  ff.off('log', handler)
-  await ff.deleteFile(name)
-
   return duration
 }
 
-// Takes the shuffle plan + real files, produces one stitched MP4 with the audio.
-export async function generateVideo(
-  clips: File[],
-  audio: File,
-  plan: Segment[],
-  useCrossfade: boolean,
-  onProgress?: (msg: string) => void
-): Promise<string> {
-  const ff = await getFFmpeg()
+export async function renderWithFfmpeg(job: SizedJob, onProgress: OnProgress, signal: AbortSignal): Promise<Blob> {
+  const { clips, clipSizes, song, plan, width: W, height: H, crossfade } = job
+  if (signal.aborted) throw abortError()
 
-  // 1. Load all clip files + audio into ffmpeg's memory
-  onProgress?.('Loading files…')
-  const clipNames: string[] = []
-  for (let i = 0; i < clips.length; i++) {
-    const name = `clip${i}.mp4`
-    await ff.writeFile(name, await fetchFile(clips[i]))
-    clipNames.push(name)
+  const ff = await loadEngine((fraction) => onProgress({ stage: 'engine', fraction }))
+  if (signal.aborted) throw abortError()
+  // terminate() rejects the running command, which lands in catch below.
+  const onAbort = () => resetEngine()
+  signal.addEventListener('abort', onAbort)
+
+  let segDone = 0
+  const steps = plan.length + 1
+  const onExecProgress = ({ progress }: { progress: number }) => {
+    if (progress >= 0 && progress <= 1) onProgress({ stage: 'render', fraction: (segDone + progress) / steps })
   }
-  await ff.writeFile('audio.mp3', await fetchFile(audio))
+  ff.on('progress', onExecProgress)
 
-  // 2 + 3. Cut and stitch in interleaved batches so memory never holds
-  // more than one batch of segments at a time.
-  onProgress?.('Processing…')
-  const BATCH = 8
-  const chunkFiles: string[] = []
-  let segCounter = 0
+  const run = async (args: string[], failure: () => Error) => {
+    const code = await ff.exec(['-hide_banner', ...args])
+    if (code !== 0) throw failure()
+  }
 
-  for (let batchStart = 0; batchStart < plan.length; batchStart += BATCH) {
-    const batchEnd = Math.min(batchStart + BATCH, plan.length)
-    const batchSegNames: string[] = []
-
-    // Cut this batch's segments
-    for (let i = batchStart; i < batchEnd; i++) {
-      const seg = plan[i]
-      const out = `seg${i}.mp4`
-      const fadeDur = 0.4
-      const vf = [
-        'scale=1920:1080:force_original_aspect_ratio=decrease',
-        'pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
-        'setsar=1',
-        'fps=30',
-      ]
-      if (useCrossfade) {
-        const fadeOutStart = Math.max(0, seg.duration - fadeDur)
-        vf.push(`fade=t=in:st=0:d=${fadeDur}`)
-        vf.push(`fade=t=out:st=${fadeOutStart.toFixed(2)}:d=${fadeDur}`)
-      }
-      await ff.exec([
-        '-ss', String(seg.start),
-        '-i', clipNames[seg.clipIndex],
-        '-t', String(seg.duration),
-        '-an',
-        '-vf', vf.join(','),
-        '-c:v', 'libx264', '-preset', 'ultrafast',
-        out,
-      ])
-      batchSegNames.push(out)
-      segCounter++
-      onProgress?.(`Processing segment ${segCounter} of ${plan.length}`)
-    }
-
-    // Immediately stitch this batch into a chunk
-    const chunkName = `chunk${chunkFiles.length}.mp4`
-    const listText = batchSegNames.map((f) => `file '${f}'`).join('\n')
-    await ff.writeFile('list.txt', listText)
-    await ff.exec([
-      '-f', 'concat', '-safe', '0', '-i', 'list.txt',
-      '-c', 'copy', chunkName,
+  try {
+    const dir = await mountFiles(ff, [
+      ...clips.map((data, i) => ({ name: `c${i}`, data })),
+      { name: 'song', data: song },
     ])
-    chunkFiles.push(chunkName)
 
-    // Free this batch's segments right away — keeps memory flat
-    for (const f of batchSegNames) {
-      try { await ff.deleteFile(f) } catch { /* already gone */ }
+    // Cut and stitch in interleaved batches so memory never holds
+    // more than one batch of segments at a time.
+    const BATCH = 8
+    const chunkFiles: string[] = []
+    for (let batchStart = 0; batchStart < plan.length; batchStart += BATCH) {
+      const batchSegNames: string[] = []
+      for (let i = batchStart; i < Math.min(batchStart + BATCH, plan.length); i++) {
+        const seg = plan[i]
+        const out = `seg${i}.mp4`
+        const size = clipSizes[seg.clipIndex]
+        const vf = fillsFrame(size.width, size.height, W, H)
+          ? [`scale=${W}:${H}:force_original_aspect_ratio=increase:flags=fast_bilinear`, `crop=${W}:${H}`]
+          : [`scale=${W}:${H}:force_original_aspect_ratio=decrease:flags=fast_bilinear`, `pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2`]
+        vf.push('setsar=1', 'fps=30', 'format=yuv420p')
+        if (crossfade) {
+          const fadeDur = 0.4
+          vf.push(`fade=t=in:st=0:d=${fadeDur}`)
+          vf.push(`fade=t=out:st=${Math.max(0, seg.duration - fadeDur).toFixed(2)}:d=${fadeDur}`)
+        }
+        await run(
+          ['-ss', String(seg.start), '-i', `${dir}/c${seg.clipIndex}`, '-t', String(seg.duration),
+            '-an', '-vf', vf.join(','), '-c:v', 'libx264', '-preset', 'ultrafast', out],
+          () => new ClipError(seg.clipIndex),
+        )
+        batchSegNames.push(out)
+        segDone++
+        onProgress({ stage: 'render', fraction: segDone / steps })
+      }
+
+      const chunkName = `chunk${chunkFiles.length}.mp4`
+      await ff.writeFile('list.txt', batchSegNames.map((f) => `file '${f}'`).join('\n'))
+      await run(['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', chunkName], () => new Error('Stitching failed'))
+      chunkFiles.push(chunkName)
+      for (const f of [...batchSegNames, 'list.txt']) await ff.deleteFile(f).catch(() => {})
     }
-    try { await ff.deleteFile('list.txt') } catch { /* ignore */ }
-  }
 
-  // Free source clips now that all cutting is done
-  for (const name of clipNames) {
-    try { await ff.deleteFile(name) } catch { /* already gone */ }
-  }
+    await ff.writeFile('chunks.txt', chunkFiles.map((f) => `file '${f}'`).join('\n'))
+    await run(['-f', 'concat', '-safe', '0', '-i', 'chunks.txt', '-c', 'copy', 'silent.mp4'], () => new Error('Stitching failed'))
+    for (const f of [...chunkFiles, 'chunks.txt']) await ff.deleteFile(f).catch(() => {})
 
-  // Combine all chunks into the final silent video
-  onProgress?.('Combining…')
-  const chunkList = chunkFiles.map((f) => `file '${f}'`).join('\n')
-  await ff.writeFile('chunks.txt', chunkList)
-  await ff.exec([
-    '-f', 'concat', '-safe', '0', '-i', 'chunks.txt',
-    '-c', 'copy', 'silent.mp4',
-  ])
-  for (const f of chunkFiles) {
-    try { await ff.deleteFile(f) } catch { /* ignore */ }
-  }
-  try { await ff.deleteFile('chunks.txt') } catch { /* ignore */ }
+    await run(
+      ['-i', 'silent.mp4', '-i', `${dir}/song`, '-map', '0:v:0', '-map', '1:a:0',
+        '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart', 'final.mp4'],
+      () => new Error('Adding the song failed'),
+    )
+    await ff.deleteFile('silent.mp4').catch(() => {})
+    onProgress({ stage: 'finish', fraction: 1 })
 
-  // 4. Add the audio track, trim to whichever ends first
-  onProgress?.('Adding music…')
-  await ff.exec([
-    '-i', 'silent.mp4',
-    '-i', 'audio.mp3',
-    '-c:v', 'copy', '-c:a', 'aac',
-    '-shortest', 'final.mp4',
-  ])
-// Free intermediates — final.mp4 already exists, safe to clean
-  try { await ff.deleteFile('silent.mp4') } catch { /* ignore */ }
-  try { await ff.deleteFile('audio.mp3') } catch { /* ignore */ }
-  // 5. Read the result back out as a playable URL
-  onProgress?.('Finishing…')
-  const data = await ff.readFile('final.mp4')
-  const bytes = new Uint8Array(data as Uint8Array)
-  const blob = new Blob([bytes.buffer], { type: 'video/mp4' })
-  return URL.createObjectURL(blob)
+    const data = await ff.readFile('final.mp4')
+    await ff.deleteFile('final.mp4').catch(() => {})
+    await unmountFiles(ff, dir)
+    return new Blob([data as Uint8Array<ArrayBuffer>], { type: 'video/mp4' })
+  } catch (err) {
+    resetEngine()
+    if (signal.aborted) throw abortError()
+    throw err
+  } finally {
+    signal.removeEventListener('abort', onAbort)
+    ff.off('progress', onExecProgress)
+  }
 }
