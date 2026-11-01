@@ -9,11 +9,12 @@ import {
   Input,
   Mp4OutputFormat,
   Output,
-  QUALITY_HIGH,
+  QUALITY_MEDIUM,
   canEncodeAudio,
   canEncodeVideo,
 } from 'mediabunny'
 import { ClipError, abortError, fillsFrame, type OnProgress, type SizedJob } from './render'
+import { CaptionPainter, loadCaptionFont } from './captions'
 
 // Renders with the browser's own decoders and the device's hardware video
 // encoder (WebCodecs). Clips are read straight from disk, never copied whole
@@ -27,7 +28,7 @@ export async function canRenderFast(width: number, height: number): Promise<bool
     return false
   }
   try {
-    return await canEncodeVideo('avc', { width, height, bitrate: QUALITY_HIGH, frameRate: FPS })
+    return await canEncodeVideo('avc', { width, height, bitrate: QUALITY_MEDIUM, frameRate: FPS })
   } catch {
     return false
   }
@@ -74,9 +75,10 @@ async function openClip(file: File, W: number, H: number, inputs: Input[]): Prom
 }
 
 export async function renderFast(job: SizedJob, onProgress: OnProgress, signal: AbortSignal): Promise<Blob> {
-  const { clips, song, plan, width: W, height: H, crossfade } = job
+  const { clips, song, plan, width: W, height: H, crossfade, captions } = job
   if (signal.aborted) throw abortError()
   await ensureAac()
+  if (captions) await loadCaptionFont()
 
   const stop = new AbortController()
   const onAbort = () => stop.abort()
@@ -109,7 +111,9 @@ export async function renderFast(job: SizedJob, onProgress: OnProgress, signal: 
       ctx.drawImage(frame, Math.round((W - src.w) / 2), Math.round((H - src.h) / 2))
     }
 
-    const videoSource = new CanvasSource(canvas, { codec: 'avc', bitrate: QUALITY_HIGH, keyFrameInterval: 2 })
+    const captionPainter = captions ? new CaptionPainter(captions, W, H) : null
+
+    const videoSource = new CanvasSource(canvas, { codec: 'avc', bitrate: QUALITY_MEDIUM, keyFrameInterval: 2 })
     const audioSource = new AudioBufferSource({ codec: 'aac', bitrate: 192_000 })
     output.addVideoTrack(videoSource)
     output.addAudioTrack(audioSource)
@@ -160,6 +164,8 @@ export async function renderFast(job: SizedJob, onProgress: OnProgress, signal: 
                 ctx.fillRect(0, 0, W, H)
               }
             }
+            // The video runs in step with the song, so output time is song time.
+            captionPainter?.paint(ctx, (f0 + k) / FPS)
           }
           await videoSource.add((f0 + k) / FPS, 1 / FPS)
           done++

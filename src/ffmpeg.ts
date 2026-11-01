@@ -2,6 +2,7 @@ import { FFmpeg, FFFSType } from '@ffmpeg/ffmpeg'
 import coreURL from '@ffmpeg/core?url'
 import wasmURL from '@ffmpeg/core/wasm?url'
 import { ClipError, EngineLoadError, abortError, fillsFrame, type OnProgress, type SizedJob } from './render'
+import { CAPTION_FONT_URL, layoutCaption, loadCaptionFont } from './captions'
 
 // Fallback renderer for browsers without hardware encoding (WebCodecs), or for
 // files the browser itself can't decode. Software encoding on one thread, so
@@ -99,7 +100,7 @@ export async function getDuration(file: File): Promise<number> {
 }
 
 export async function renderWithFfmpeg(job: SizedJob, onProgress: OnProgress, signal: AbortSignal): Promise<Blob> {
-  const { clips, clipSizes, song, plan, width: W, height: H, crossfade } = job
+  const { clips, clipSizes, song, plan, width: W, height: H, crossfade, captions } = job
   if (signal.aborted) throw abortError()
 
   const ff = await loadEngine((fraction) => onProgress({ stage: 'engine', fraction }))
@@ -126,10 +127,28 @@ export async function renderWithFfmpeg(job: SizedJob, onProgress: OnProgress, si
       { name: 'song', data: song },
     ])
 
+    // Each caption row becomes its own drawtext so every row is centred.
+    // Text goes through files, which avoids escaping lyrics inside the filter.
+    const captionRows: { start: number; end: number; file: string; size: number; y: number }[] = []
+    if (captions) {
+      await loadCaptionFont()
+      await ff.writeFile('caption.ttf', new Uint8Array(await (await fetch(CAPTION_FONT_URL)).arrayBuffer()))
+      for (const [i, line] of captions.entries()) {
+        const layout = layoutCaption(line.text, W, H)
+        for (const [r, row] of layout.rows.entries()) {
+          const file = `cap${i}_${r}.txt`
+          await ff.writeFile(file, row)
+          const y = layout.bottom - (layout.rows.length - 1 - r) * layout.lineHeight
+          captionRows.push({ start: line.start, end: line.end, file, size: layout.fontSize, y })
+        }
+      }
+    }
+
     // Cut and stitch in interleaved batches so memory never holds
     // more than one batch of segments at a time.
     const BATCH = 8
     const chunkFiles: string[] = []
+    let segStart = 0
     for (let batchStart = 0; batchStart < plan.length; batchStart += BATCH) {
       const batchSegNames: string[] = []
       for (let i = batchStart; i < Math.min(batchStart + BATCH, plan.length); i++) {
@@ -145,9 +164,19 @@ export async function renderWithFfmpeg(job: SizedJob, onProgress: OnProgress, si
           vf.push(`fade=t=in:st=0:d=${fadeDur}`)
           vf.push(`fade=t=out:st=${Math.max(0, seg.duration - fadeDur).toFixed(2)}:d=${fadeDur}`)
         }
+        // Segment time starts at 0, so shift each caption by where the segment sits in the song.
+        for (const c of captionRows) {
+          const a = c.start - segStart
+          const b = c.end - segStart
+          if (b <= 0 || a >= seg.duration) continue
+          vf.push(`drawtext=fontfile=caption.ttf:textfile=${c.file}:fontsize=${c.size}:fontcolor=white` +
+            `:borderw=${Math.max(3, Math.round(c.size * 0.07))}:bordercolor=black@0.85` +
+            `:x=(w-text_w)/2:y=${c.y}-ascent:enable='between(t,${a.toFixed(3)},${b.toFixed(3)})'`)
+        }
+        segStart += seg.duration
         await run(
           ['-ss', String(seg.start), '-i', `${dir}/c${seg.clipIndex}`, '-t', String(seg.duration),
-            '-an', '-vf', vf.join(','), '-c:v', 'libx264', '-preset', 'ultrafast', out],
+            '-an', '-vf', vf.join(','), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', out],
           () => new ClipError(seg.clipIndex),
         )
         batchSegNames.push(out)

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { buildShufflePlan } from './shuffle'
 import type { MediaInfo } from './probe'
+import type { Lyrics } from './lyrics'
 import { ClipError, EngineLoadError, autoShape, isAbort, render, type Progress, type Shape } from './render'
 
 interface ClipItem {
@@ -13,6 +14,13 @@ interface SongItem {
   file: File
   info: MediaInfo | null
 }
+
+type LyricsState =
+  | { status: 'idle' }
+  | { status: 'searching'; query: string }
+  | { status: 'found'; lyrics: Lyrics }
+  | { status: 'missing'; query: string }
+  | { status: 'unavailable'; query: string; guess?: { title: string; artist: string } }
 
 interface Result {
   url: string
@@ -67,6 +75,10 @@ function App() {
   const [song, setSong] = useState<SongItem | null>(null)
   const [segLength, setSegLength] = useState(4)
   const [crossfade, setCrossfade] = useState(false)
+  const [lyrics, setLyrics] = useState<LyricsState>({ status: 'idle' })
+  const [captionsOn, setCaptionsOn] = useState(true)
+  const [lyricsQuery, setLyricsQuery] = useState('')
+  const [searchOpen, setSearchOpen] = useState(false)
   const [shapeChoice, setShapeChoice] = useState<'auto' | Shape>('auto')
   const [dragging, setDragging] = useState(false)
   const [notice, setNotice] = useState('')
@@ -110,9 +122,47 @@ function App() {
 
   const pickSong = async (file: File) => {
     setSong({ file, info: null })
-    const { probeSong } = await loadProbe()
+    setLyrics({ status: 'idle' })
+    setSearchOpen(false)
+    const { probeSong, readSongTags } = await loadProbe()
     const info = await probeSong(file)
     setSong((cur) => (cur?.file === file ? { file, info } : cur))
+    if (info.duration <= 0) return
+    const { guessSong } = await import('./lyrics')
+    const guess = guessSong(file.name, await readSongTags(file))
+    await lookUpLyrics(`${guess.artist} ${guess.title}`.trim(), info.duration, file, guess)
+  }
+
+  const songRef = useRef<File | null>(null)
+  useEffect(() => { songRef.current = song?.file ?? null }, [song])
+
+  const lookUpLyrics = async (query: string, duration: number, file: File, guess?: { title: string; artist: string }) => {
+    setLyricsQuery(query)
+    setLyrics({ status: 'searching', query })
+    const { findLyrics, LyricsUnavailableError } = await import('./lyrics')
+    let found
+    try {
+      found = await findLyrics(guess ?? { title: query, artist: '' }, duration)
+    } catch (err) {
+      if (songRef.current !== file) return
+      if (err instanceof LyricsUnavailableError) {
+        setLyrics({ status: 'unavailable', query, guess })
+        track('lyrics_unavailable')
+        return
+      }
+      throw err
+    }
+    // The user may have picked another song while this was in flight.
+    if (songRef.current !== file) return
+    if (found) {
+      setLyrics({ status: 'found', lyrics: found })
+      setCaptionsOn(true)
+      setSearchOpen(false)
+    } else {
+      setLyrics({ status: 'missing', query })
+      setSearchOpen(true)
+    }
+    track(found ? 'lyrics_found' : 'lyrics_not_found', { manual: !guess })
   }
 
   const addFiles = async (files: File[]) => {
@@ -189,6 +239,7 @@ function App() {
           plan,
           shape,
           crossfade,
+          captions: captionsOn && lyrics.status === 'found' ? lyrics.lyrics.lines : null,
           fastReadable: used.every((c) => c.info!.fast) && song.info.fast,
         },
         onProgress,
@@ -199,7 +250,7 @@ function App() {
       requestAnimationFrame(() => resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
       track('video_generated', {
         clips: used.length, cutLength: segLength, engine: out.engine, seconds,
-        songSeconds: Math.round(songSeconds), shape, crossfade, fallbackReason: out.fallbackReason,
+        songSeconds: Math.round(songSeconds), shape, crossfade, captions: captionsOn && lyrics.status === 'found', fallbackReason: out.fallbackReason,
       })
     } catch (err) {
       if (isAbort(err)) {
@@ -334,6 +385,57 @@ function App() {
             )}
           </label>
 
+          {song && songReady && lyrics.status !== 'idle' && (
+            <div data-test="lyrics" className="-mt-4 mb-6 px-1 text-xs">
+              {lyrics.status === 'searching' && <p className="text-neutral-500">Looking up the lyrics…</p>}
+              {lyrics.status === 'found' && (
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-neutral-400 truncate">
+                    Lyrics: <span className="text-neutral-200">{lyrics.lyrics.title}</span> by {lyrics.lyrics.artist}
+                    {!searchOpen && (
+                      <button onClick={() => setSearchOpen(true)} className="ml-2 text-violet-400 hover:text-violet-300">
+                        Wrong song?
+                      </button>
+                    )}
+                  </p>
+                </div>
+              )}
+              {lyrics.status === 'unavailable' && (
+                <p className="text-neutral-500">
+                  The lyrics service isn't responding right now.
+                  <button
+                    data-test="lyrics-retry"
+                    onClick={() => song.info && void lookUpLyrics(lyrics.query, song.info.duration, song.file, lyrics.guess)}
+                    className="ml-2 text-violet-400 hover:text-violet-300"
+                  >
+                    Try again
+                  </button>
+                </p>
+              )}
+              {lyrics.status === 'missing' && (
+                <p className="text-neutral-500">No timed lyrics found for this song. Search by name, or leave captions off.</p>
+              )}
+              {searchOpen && (
+                <form
+                  className="flex gap-2 mt-2"
+                  onSubmit={(e) => {
+                    e.preventDefault()
+                    if (lyricsQuery.trim() && song.info) void lookUpLyrics(lyricsQuery.trim(), song.info.duration, song.file)
+                  }}
+                >
+                  <input
+                    data-test="lyrics-query"
+                    value={lyricsQuery}
+                    onChange={(e) => setLyricsQuery(e.target.value)}
+                    placeholder="Artist and song name"
+                    className="flex-1 min-w-0 bg-[#0a0a0f] border border-neutral-700 rounded-lg px-3 py-2 text-sm focus:border-violet-500 focus:outline-none"
+                  />
+                  <button className="bg-white/5 hover:bg-white/10 transition rounded-lg px-3 py-2 text-sm">Search</button>
+                </form>
+              )}
+            </div>
+          )}
+
           <div className="space-y-4 mb-6">
             <div className="flex justify-between items-center">
               <label htmlFor="shape" className="text-sm text-neutral-400">Shape</label>
@@ -364,6 +466,21 @@ function App() {
                 ))}
               </select>
             </div>
+            {lyrics.status === 'found' && (
+              <div className="flex justify-between items-center">
+                <span className="text-sm text-neutral-400">Lyric captions</span>
+                <button
+                  role="switch"
+                  data-test="captions"
+                  aria-checked={captionsOn}
+                  aria-label="Lyric captions"
+                  onClick={() => setCaptionsOn(!captionsOn)}
+                  className={`relative w-11 h-6 rounded-full transition ${captionsOn ? 'bg-violet-600' : 'bg-neutral-700'}`}
+                >
+                  <span className={`absolute top-1 left-1 w-4 h-4 bg-white rounded-full transition-transform ${captionsOn ? 'translate-x-5' : ''}`} />
+                </button>
+              </div>
+            )}
             <div className="flex justify-between items-center">
               <span className="text-sm text-neutral-400">Smooth transitions</span>
               <button
@@ -435,7 +552,7 @@ function App() {
                 <p className="text-sm text-violet-300 text-center">You're on the list. Thanks! 🎬</p>
               ) : (
                 <>
-                  <p className="text-sm text-neutral-300 mb-1">Want auto lyrics, longer exports and saved history?</p>
+                  <p className="text-sm text-neutral-300 mb-1">Want longer exports and saved history?</p>
                   <p className="text-xs text-neutral-500 mb-3">Join the Pro waitlist and be first to know.</p>
                   <div className="flex gap-2">
                     <input

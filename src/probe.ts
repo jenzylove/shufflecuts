@@ -94,3 +94,18 @@ async function probeWithEngine(file: File): Promise<MediaInfo> {
     return { duration: 0, width: 0, height: 0, fast: false }
   }
 }
+
+// Title and artist from the song's own tags (ID3, MP4 and so on), when present.
+export async function readSongTags(file: File): Promise<{ title?: string; artist?: string }> {
+  try {
+    const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS })
+    try {
+      const tags = await input.getMetadataTags()
+      return { title: tags.title, artist: tags.artist }
+    } finally {
+      input.dispose()
+    }
+  } catch {
+    return {}
+  }
+}

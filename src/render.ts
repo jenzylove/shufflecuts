@@ -1,4 +1,5 @@
 import type { Segment } from './shuffle'
+import type { LyricLine } from './lyrics'
 
 export type Shape = 'portrait' | 'landscape' | 'square'
 
@@ -10,6 +11,8 @@ export interface RenderJob {
   plan: Segment[]
   shape: Shape
   crossfade: boolean
+  // Timed lyrics to burn in, or null for no captions.
+  captions: LyricLine[] | null
   // Every clip and the song can be read by the browser's own decoders.
   fastReadable: boolean
 }
