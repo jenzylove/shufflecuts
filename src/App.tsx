@@ -258,7 +258,10 @@ function App() {
       } else {
         console.error(err)
         setError(errorMessage(err, files))
-        track('render_failed', { clips: used.length, songSeconds: Math.round(songSeconds), reason: String(err).slice(0, 120) })
+        track('render_failed', {
+          clips: used.length, songSeconds: Math.round(songSeconds), reason: String(err).slice(0, 120),
+          fallbackReason: (err as { fallbackReason?: string }).fallbackReason,
+        })
       }
     } finally {
       abortRef.current = null

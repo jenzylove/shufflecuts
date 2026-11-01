@@ -23,12 +23,16 @@ import { CaptionPainter, loadCaptionFont } from './captions'
 const FPS = 30
 const FADE = 0.4
 
-export async function canRenderFast(width: number, height: number): Promise<boolean> {
+// The hardware encoder first. On busy cuts some GPUs drop it partway through
+// ("Encoding error"); the browser's software encoder then finishes the job.
+export type Encoder = 'no-preference' | 'prefer-software'
+
+export async function canRenderFast(width: number, height: number, encoder: Encoder = 'no-preference'): Promise<boolean> {
   if (typeof VideoEncoder === 'undefined' || typeof VideoDecoder === 'undefined' || typeof AudioBuffer === 'undefined') {
     return false
   }
   try {
-    return await canEncodeVideo('avc', { width, height, bitrate: QUALITY_MEDIUM, frameRate: FPS })
+    return await canEncodeVideo('avc', { width, height, bitrate: QUALITY_MEDIUM, frameRate: FPS, hardwareAcceleration: encoder })
   } catch {
     return false
   }
@@ -74,7 +78,7 @@ async function openClip(file: File, W: number, H: number, inputs: Input[]): Prom
   return { sink: new CanvasSink(track, { width: w, height: h, fit: 'fill', poolSize: 3 }), first, fill: false, w, h }
 }
 
-export async function renderFast(job: SizedJob, onProgress: OnProgress, signal: AbortSignal): Promise<Blob> {
+export async function renderFast(job: SizedJob, onProgress: OnProgress, signal: AbortSignal, encoder: Encoder = 'no-preference'): Promise<Blob> {
   const { clips, song, plan, width: W, height: H, crossfade, captions } = job
   if (signal.aborted) throw abortError()
   await ensureAac()
@@ -113,7 +117,7 @@ export async function renderFast(job: SizedJob, onProgress: OnProgress, signal: 
 
     const captionPainter = captions ? new CaptionPainter(captions, W, H) : null
 
-    const videoSource = new CanvasSource(canvas, { codec: 'avc', bitrate: QUALITY_MEDIUM, keyFrameInterval: 2 })
+    const videoSource = new CanvasSource(canvas, { codec: 'avc', bitrate: QUALITY_MEDIUM, keyFrameInterval: 2, hardwareAcceleration: encoder })
     const audioSource = new AudioBufferSource({ codec: 'aac', bitrate: 192_000 })
     output.addVideoTrack(videoSource)
     output.addAudioTrack(audioSource)

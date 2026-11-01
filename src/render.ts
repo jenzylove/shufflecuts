@@ -65,24 +65,34 @@ export async function render(job: RenderJob, onProgress: OnProgress, signal: Abo
   if (job.fastReadable) {
     fallbackReason = 'no_hardware_encoder'
     const fast = await import('./render-fast')
-    for (const [width, height] of FAST_SIZES[job.shape]) {
+    sizes: for (const [width, height] of FAST_SIZES[job.shape]) {
       if (!(await fast.canRenderFast(width, height))) continue
-      try {
-        const blob = await fast.renderFast({ ...job, width, height }, onProgress, signal)
-        return { blob, engine: 'fast' }
-      } catch (err) {
-        if (isAbort(err)) throw err
-        console.warn('Fast render failed, switching to ffmpeg', err)
-        fallbackReason = err instanceof Error ? err.message.slice(0, 120) : 'fast_render_failed'
-        break
+      for (const encoder of ['no-preference', 'prefer-software'] as const) {
+        if (encoder === 'prefer-software' && !(await fast.canRenderFast(width, height, encoder))) break sizes
+        try {
+          const blob = await fast.renderFast({ ...job, width, height }, onProgress, signal, encoder)
+          return { blob, engine: 'fast', fallbackReason: encoder === 'prefer-software' ? `software_encoder: ${fallbackReason}` : undefined }
+        } catch (err) {
+          if (isAbort(err)) throw err
+          console.warn(`Fast render failed (${encoder})`, err)
+          fallbackReason = err instanceof Error ? err.message.slice(0, 120) : 'fast_render_failed'
+          // A clip the browser can't decode won't do better on another encoder.
+          if (err instanceof ClipError) break sizes
+        }
       }
+      break
     }
   }
 
   const { renderWithFfmpeg } = await import('./ffmpeg')
   const [width, height] = FALLBACK_SIZES[job.shape]
-  const blob = await renderWithFfmpeg({ ...job, width, height }, onProgress, signal)
-  return { blob, engine: 'ffmpeg', fallbackReason }
+  try {
+    const blob = await renderWithFfmpeg({ ...job, width, height }, onProgress, signal)
+    return { blob, engine: 'ffmpeg', fallbackReason }
+  } catch (err) {
+    if (err instanceof Error) Object.assign(err, { fallbackReason })
+    throw err
+  }
 }
 
 // The shape most of the clips already have, so most shots fill the frame.
