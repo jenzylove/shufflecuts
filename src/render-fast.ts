@@ -6,10 +6,12 @@ import {
   BufferTarget,
   CanvasSink,
   CanvasSource,
+  EncodedPacketSink,
   Input,
   Mp4OutputFormat,
   Output,
   QUALITY_MEDIUM,
+  StreamTarget,
   canEncodeAudio,
   canEncodeVideo,
 } from 'mediabunny'
@@ -50,8 +52,51 @@ function ensureAac(): Promise<void> {
   return aacReady
 }
 
+// The finished video goes to the browser's private file storage (OPFS) as it
+// is made, so a long song never sits whole in memory. Browsers without it
+// keep the video in memory as before.
+interface RenderTarget {
+  output: Output
+  finish: () => Promise<Blob>
+  discard: () => Promise<void>
+}
+
+const RENDER_PREFIX = 'shufflecuts-render-'
+
+async function openTarget(): Promise<RenderTarget> {
+  try {
+    const root = await navigator.storage.getDirectory()
+    // Only the newest video is kept: an older one is gone from the page by now.
+    for await (const name of (root as unknown as { keys(): AsyncIterable<string> }).keys()) {
+      if (name.startsWith(RENDER_PREFIX)) await root.removeEntry(name).catch(() => {})
+    }
+    const name = `${RENDER_PREFIX}${Date.now()}.mp4`
+    const handle = await root.getFileHandle(name, { create: true })
+    const writable = await handle.createWritable()
+    // 'reserve' keeps the index at the front of the file, so it starts
+    // playing at once when shared, without holding the video in memory.
+    const output = new Output({
+      format: new Mp4OutputFormat({ fastStart: 'reserve' }),
+      target: new StreamTarget(writable, { chunked: true, chunkSize: 4 * 2 ** 20 }),
+    })
+    return {
+      output,
+      finish: async () => handle.getFile(),
+      discard: async () => { await writable.abort().catch(() => {}); await root.removeEntry(name).catch(() => {}) },
+    }
+  } catch {
+    const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target: new BufferTarget() })
+    return {
+      output,
+      finish: async () => new Blob([(output.target as BufferTarget).buffer!], { type: 'video/mp4' }),
+      discard: async () => {},
+    }
+  }
+}
+
 interface ClipSource {
   sink: CanvasSink
+  packets: EncodedPacketSink
   first: number
   fill: boolean
   w: number
@@ -68,14 +113,14 @@ async function openClip(file: File, W: number, H: number, inputs: Input[]): Prom
   const dh = await track.getDisplayHeight()
 
   if (fillsFrame(dw, dh, W, H)) {
-    return { sink: new CanvasSink(track, { width: W, height: H, fit: 'cover', poolSize: 3 }), first, fill: true, w: W, h: H }
+    return { sink: new CanvasSink(track, { width: W, height: H, fit: 'cover', poolSize: 3 }), packets: new EncodedPacketSink(track), first, fill: true, w: W, h: H }
   }
   // Fit the whole shot inside the frame; paint() puts a soft blurred copy
   // of it behind, so there are no black bars.
   const scale = Math.min(W / dw, H / dh)
   const w = Math.max(2, Math.round(dw * scale))
   const h = Math.max(2, Math.round(dh * scale))
-  return { sink: new CanvasSink(track, { width: w, height: h, fit: 'fill', poolSize: 3 }), first, fill: false, w, h }
+  return { sink: new CanvasSink(track, { width: w, height: h, fit: 'fill', poolSize: 3 }), packets: new EncodedPacketSink(track), first, fill: false, w, h }
 }
 
 export async function renderFast(job: SizedJob, onProgress: OnProgress, signal: AbortSignal, encoder: Encoder = 'no-preference'): Promise<Blob> {
@@ -88,7 +133,9 @@ export async function renderFast(job: SizedJob, onProgress: OnProgress, signal: 
   const onAbort = () => stop.abort()
   signal.addEventListener('abort', onAbort)
   const inputs: Input[] = []
-  const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target: new BufferTarget() })
+  const videoEnd = plan.reduce((sum, s) => sum + s.duration, 0)
+  const totalFrames = Math.max(1, Math.round(videoEnd * FPS))
+  const { output, finish, discard } = await openTarget()
 
   try {
     const canvas = document.createElement('canvas')
@@ -119,8 +166,10 @@ export async function renderFast(job: SizedJob, onProgress: OnProgress, signal: 
 
     const videoSource = new CanvasSource(canvas, { codec: 'avc', bitrate: QUALITY_MEDIUM, keyFrameInterval: 2, hardwareAcceleration: encoder })
     const audioSource = new AudioBufferSource({ codec: 'aac', bitrate: 192_000 })
-    output.addVideoTrack(videoSource)
-    output.addAudioTrack(audioSource)
+    // Upper bounds for the 'reserve' index: one packet per frame, and AAC
+    // packets of 1024 samples at up to 96 kHz.
+    output.addVideoTrack(videoSource, { maximumPacketCount: totalFrames + 30 })
+    output.addAudioTrack(audioSource, { maximumPacketCount: Math.ceil((videoEnd * 96000) / 1024) + 200 })
     await output.start()
 
     const sources = new Map<number, ClipSource>()
@@ -132,8 +181,6 @@ export async function renderFast(job: SizedJob, onProgress: OnProgress, signal: 
       }
     }
 
-    const videoEnd = plan.reduce((sum, s) => sum + s.duration, 0)
-    const totalFrames = Math.max(1, Math.round(videoEnd * FPS))
 
     const videoTask = async () => {
       let t = 0
@@ -144,7 +191,13 @@ export async function renderFast(job: SizedJob, onProgress: OnProgress, signal: 
         const count = Math.round(t * FPS) - f0
         if (count <= 0) continue
         const src = sources.get(seg.clipIndex)!
-        const times = Array.from({ length: count }, (_, k) => src.first + seg.start + k / FPS)
+        // Start the shot on the keyframe at or before the planned point. Any
+        // other start makes the decoder chew through frames nobody sees, which
+        // dominates the work on short cuts.
+        let at = src.first + seg.start
+        const key = await src.packets.getKeyPacket(at, { metadataOnly: true }).catch(() => null)
+        if (key && key.timestamp >= src.first) at = key.timestamp
+        const times = Array.from({ length: count }, (_, k) => at + k / FPS)
         const frames = src.sink.canvasesAtTimestamps(times)
         for (let k = 0; k < count; k++) {
           if (stop.signal.aborted) {
@@ -209,9 +262,10 @@ export async function renderFast(job: SizedJob, onProgress: OnProgress, signal: 
     audioSource.close()
     onProgress({ stage: 'finish', fraction: 1 })
     await output.finalize()
-    return new Blob([output.target.buffer!], { type: 'video/mp4' })
+    return await finish()
   } catch (err) {
     if (output.state === 'started' || output.state === 'pending') await output.cancel().catch(() => {})
+    await discard()
     if (signal.aborted) throw abortError()
     throw err
   } finally {

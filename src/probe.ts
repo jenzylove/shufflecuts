@@ -33,7 +33,7 @@ export async function probeVideo(file: File): Promise<MediaInfo> {
 
   const viaElement = await probeWithElement(file, 'video')
   if (viaElement.duration > 0) return viaElement
-  return probeWithEngine(file)
+  return probeWithEngine(file, 'video')
 }
 
 export async function probeSong(file: File): Promise<MediaInfo> {
@@ -57,7 +57,7 @@ export async function probeSong(file: File): Promise<MediaInfo> {
 
   const viaElement = await probeWithElement(file, 'audio')
   if (viaElement.duration > 0) return viaElement
-  return probeWithEngine(file)
+  return probeWithEngine(file, 'audio')
 }
 
 function probeWithElement(file: File, kind: 'video' | 'audio'): Promise<MediaInfo> {
@@ -85,13 +85,24 @@ function probeWithElement(file: File, kind: 'video' | 'audio'): Promise<MediaInf
   })
 }
 
-// Last resort for unusual formats: only these files pay for the ffmpeg download.
-async function probeWithEngine(file: File): Promise<MediaInfo> {
+const UNREADABLE: MediaInfo = { duration: 0, width: 0, height: 0, fast: false }
+
+// Formats the browser reads itself. If both readers above failed on one of
+// these, the file is damaged, and ffmpeg won't do better.
+const BROWSER_FORMATS = {
+  video: /.(mp4|m4v|mov|webm)$/i,
+  audio: /.(mp3|m4a|aac|wav|ogg|oga|opus|flac|webm|mp4)$/i,
+}
+
+// Last resort for unusual formats (AVI, MKV, WMA...): only these files pay
+// for the ffmpeg download.
+async function probeWithEngine(file: File, kind: 'video' | 'audio'): Promise<MediaInfo> {
+  if (BROWSER_FORMATS[kind].test(file.name)) return UNREADABLE
   try {
     const { getDuration } = await import('./ffmpeg')
     return { duration: await getDuration(file), width: 0, height: 0, fast: false }
   } catch {
-    return { duration: 0, width: 0, height: 0, fast: false }
+    return UNREADABLE
   }
 }
 

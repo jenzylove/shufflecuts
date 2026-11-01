@@ -99,11 +99,17 @@ export async function getDuration(file: File): Promise<number> {
   return duration
 }
 
+// The engine leaks a little memory on every command, and a long song runs
+// over a hundred of them, so it is restarted every few batches. The engine
+// itself stays in the browser cache, so a restart takes about a second.
+const BATCH = 8
+const BATCHES_PER_ENGINE = 4
+
 export async function renderWithFfmpeg(job: SizedJob, onProgress: OnProgress, signal: AbortSignal): Promise<Blob> {
   const { clips, clipSizes, song, plan, width: W, height: H, crossfade, captions } = job
   if (signal.aborted) throw abortError()
 
-  const ff = await loadEngine((fraction) => onProgress({ stage: 'engine', fraction }))
+  let ff = await loadEngine((fraction) => onProgress({ stage: 'engine', fraction }))
   if (signal.aborted) throw abortError()
   // terminate() rejects the running command, which lands in catch below.
   const onAbort = () => resetEngine()
@@ -114,42 +120,58 @@ export async function renderWithFfmpeg(job: SizedJob, onProgress: OnProgress, si
   const onExecProgress = ({ progress }: { progress: number }) => {
     if (progress >= 0 && progress <= 1) onProgress({ stage: 'render', fraction: (segDone + progress) / steps })
   }
-  ff.on('progress', onExecProgress)
 
   const run = async (args: string[], failure: () => Error) => {
     const code = await ff.exec(['-hide_banner', ...args])
     if (code !== 0) throw failure()
   }
 
-  try {
-    const dir = await mountFiles(ff, [
+  // Each caption row becomes its own drawtext so every row is centred.
+  // Text goes through files, which avoids escaping lyrics inside the filter.
+  const captionRows: { start: number; end: number; file: string; text: string; size: number; y: number }[] = []
+  let font: Uint8Array | null = null
+  if (captions) {
+    await loadCaptionFont()
+    font = new Uint8Array(await (await fetch(CAPTION_FONT_URL)).arrayBuffer())
+    for (const [i, line] of captions.entries()) {
+      const layout = layoutCaption(line.text, W, H)
+      for (const [r, row] of layout.rows.entries()) {
+        const y = layout.bottom - (layout.rows.length - 1 - r) * layout.lineHeight
+        captionRows.push({ start: line.start, end: line.end, file: `cap${i}_${r}.txt`, text: row, size: layout.fontSize, y })
+      }
+    }
+  }
+
+  // Mounts the clips and writes the caption files into a (fresh) engine.
+  let dir = ''
+  const prepare = async () => {
+    ff.on('progress', onExecProgress)
+    dir = await mountFiles(ff, [
       ...clips.map((data, i) => ({ name: `c${i}`, data })),
       { name: 'song', data: song },
     ])
-
-    // Each caption row becomes its own drawtext so every row is centred.
-    // Text goes through files, which avoids escaping lyrics inside the filter.
-    const captionRows: { start: number; end: number; file: string; size: number; y: number }[] = []
-    if (captions) {
-      await loadCaptionFont()
-      await ff.writeFile('caption.ttf', new Uint8Array(await (await fetch(CAPTION_FONT_URL)).arrayBuffer()))
-      for (const [i, line] of captions.entries()) {
-        const layout = layoutCaption(line.text, W, H)
-        for (const [r, row] of layout.rows.entries()) {
-          const file = `cap${i}_${r}.txt`
-          await ff.writeFile(file, row)
-          const y = layout.bottom - (layout.rows.length - 1 - r) * layout.lineHeight
-          captionRows.push({ start: line.start, end: line.end, file, size: layout.fontSize, y })
-        }
-      }
+    if (font) {
+      await ff.writeFile('caption.ttf', font.slice())
+      for (const c of captionRows) await ff.writeFile(c.file, c.text)
     }
+  }
+  const restart = async () => {
+    ff.off('progress', onExecProgress)
+    resetEngine()
+    ff = await loadEngine()
+    if (signal.aborted) throw abortError()
+    await prepare()
+  }
 
-    // Cut and stitch in interleaved batches so memory never holds
-    // more than one batch of segments at a time.
-    const BATCH = 8
-    const chunkFiles: string[] = []
+  try {
+    await prepare()
+
+    // Cut in batches of 8 shots and stitch each batch into a chunk. Finished
+    // chunks move out of the engine's memory into the page's.
+    const chunks: Uint8Array[] = []
     let segStart = 0
     for (let batchStart = 0; batchStart < plan.length; batchStart += BATCH) {
+      if (batchStart > 0 && (batchStart / BATCH) % BATCHES_PER_ENGINE === 0) await restart()
       const batchSegNames: string[] = []
       for (let i = batchStart; i < Math.min(batchStart + BATCH, plan.length); i++) {
         const seg = plan[i]
@@ -176,7 +198,8 @@ export async function renderWithFfmpeg(job: SizedJob, onProgress: OnProgress, si
         segStart += seg.duration
         await run(
           ['-ss', String(seg.start), '-i', `${dir}/c${seg.clipIndex}`, '-t', String(seg.duration),
-            '-an', '-vf', vf.join(','), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', out],
+            '-an', '-vf', vf.join(','), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26',
+            '-maxrate', '3M', '-bufsize', '6M', out],
           () => new ClipError(seg.clipIndex),
         )
         batchSegNames.push(out)
@@ -184,23 +207,24 @@ export async function renderWithFfmpeg(job: SizedJob, onProgress: OnProgress, si
         onProgress({ stage: 'render', fraction: segDone / steps })
       }
 
-      const chunkName = `chunk${chunkFiles.length}.mp4`
       await ff.writeFile('list.txt', batchSegNames.map((f) => `file '${f}'`).join('\n'))
-      await run(['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', chunkName], () => new Error('Stitching failed'))
-      chunkFiles.push(chunkName)
-      for (const f of [...batchSegNames, 'list.txt']) await ff.deleteFile(f).catch(() => {})
+      await run(['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', 'chunk.mp4'], () => new Error('Stitching failed'))
+      chunks.push((await ff.readFile('chunk.mp4')) as Uint8Array)
+      for (const f of [...batchSegNames, 'list.txt', 'chunk.mp4']) await ff.deleteFile(f).catch(() => {})
     }
 
-    await ff.writeFile('chunks.txt', chunkFiles.map((f) => `file '${f}'`).join('\n'))
-    await run(['-f', 'concat', '-safe', '0', '-i', 'chunks.txt', '-c', 'copy', 'silent.mp4'], () => new Error('Stitching failed'))
-    for (const f of [...chunkFiles, 'chunks.txt']) await ff.deleteFile(f).catch(() => {})
-
+    // A fresh engine joins the chunks and adds the song in one pass.
+    await restart()
+    const names = chunks.map((_, i) => `chunk${i}.mp4`)
+    for (const [i, data] of chunks.entries()) await ff.writeFile(names[i], data)
+    chunks.length = 0
+    await ff.writeFile('chunks.txt', names.map((f) => `file '${f}'`).join('\n'))
     await run(
-      ['-i', 'silent.mp4', '-i', `${dir}/song`, '-map', '0:v:0', '-map', '1:a:0',
+      ['-f', 'concat', '-safe', '0', '-i', 'chunks.txt', '-i', `${dir}/song`, '-map', '0:v:0', '-map', '1:a:0',
         '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart', 'final.mp4'],
       () => new Error('Adding the song failed'),
     )
-    await ff.deleteFile('silent.mp4').catch(() => {})
+    for (const f of [...names, 'chunks.txt']) await ff.deleteFile(f).catch(() => {})
     onProgress({ stage: 'finish', fraction: 1 })
 
     const data = await ff.readFile('final.mp4')
